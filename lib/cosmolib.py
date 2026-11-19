@@ -89,6 +89,22 @@ def sink_graph(c):
     nodes += [_n("mixL", "mixer"), _n("mixR", "mixer")]
     gl, gr = [0.0] * 8, [0.0] * 8
     if c["virtual71"]:
+        # Stereo -> 7.1 upmix (so ordinary stereo music/video gets surround feeds):
+        # centre = L+R, sides/rears = decorrelated, delayed, darkened L-R ambience.
+        up = {"FC": ((0.35, 0.35), 0.0, 20000),
+              "SL": ((0.8, -0.55), 0.011, 9000), "SR": ((-0.55, 0.8), 0.013, 9000),
+              "RL": ((0.7, -0.6), 0.021, 6000), "RR": ((-0.6, 0.7), 0.024, 6000)}
+        src = {}
+        for k, ((a, b), dl, lp) in up.items():
+            nodes.append(_n(f"u{k}", "mixer", {"Gain 1": a, "Gain 2": b}))
+            L("inFL:Out", f"u{k}:In 1"); L("inFR:Out", f"u{k}:In 2")
+            o = f"u{k}:Out"
+            if dl:
+                nodes.append(_n(f"ud{k}", "delay", {"Delay (s)": dl}, "max-delay = 0.05"))
+                nodes.append(_n(f"ul{k}", "bq_lowpass", {"Freq": lp, "Q": 0.7, "Gain": 0}))
+                L(o, f"ud{k}:In"); L(f"ud{k}:Out", f"ul{k}:In"); o = f"ul{k}:Out"
+            nodes.append(_n(f"s{k}", "mixer", {"Gain 1": 1.0, "Gain 2": 1.0}))
+            L(f"in{k}:Out", f"s{k}:In 1"); L(o, f"s{k}:In 2"); src[k] = f"s{k}:Out"
         for idx, (name, az, _) in enumerate(SPEAKERS):
             k = ins[idx]; d = max(1, c["dist"][idx])
             s = abs(math.sin(math.radians(az)))
@@ -97,7 +113,11 @@ def sink_graph(c):
             g = min(2.0, 26.0 / d)
             dl = min(0.02, d * 0.00029)
             nodes.append(_n(f"d{k}", "delay", {"Delay (s)": f"{dl:.5f}"}, "max-delay = 0.03"))
-            L(f"in{k}:Out", f"d{k}:In")
+            o = src.get(k, f"in{k}:Out")
+            if abs(az) > 90:  # behind the head: pinna shadow dulls the top end
+                nodes.append(_n(f"r{k}", "bq_highshelf", {"Freq": 3500, "Q": 0.7, "Gain": -6}))
+                L(o, f"r{k}:In"); o = f"r{k}:Out"
+            L(o, f"d{k}:In")
             left_side = az < 0 or (az == 0)
             ipsi, contra = ("L", "R") if az < 0 else ("R", "L")
             if az == 0:
@@ -143,7 +163,7 @@ def sink_graph(c):
     if c["bass"]:
         steps.append(("bass", "bq_lowshelf", {"Freq": 110, "Q": 0.7, "Gain": c["bass"]}))
     peak = max([0] + [s[2]["Gain"] for s in steps if s[2]["Gain"] > 0])
-    steps.append(("head", "linear", {"Mult": f"{10 ** (-peak / 20):.4f}", "Add": 0}))
+    steps.append(("head", "linear", {"Mult": f"{10 ** (-peak / 20) * (0.55 if c['virtual71'] else 1):.4f}", "Add": 0}))
     for ch in "LR":
         for (nm, lab, ctl) in steps:
             nodes.append(_n(f"{nm}{ch}", lab, ctl)); L(last[ch], f"{nm}{ch}:In"); last[ch] = f"{nm}{ch}:Out"
