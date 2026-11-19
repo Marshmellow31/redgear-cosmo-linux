@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""cosmo-ctl: scriptable control used by the top-bar extension.
+  cosmo-ctl get | set KEY JSON | profile NAME"""
+import json, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+sys.path.insert(0, os.path.expanduser("~/.local/share/redgear-cosmo/lib"))
+import cosmolib as C
+HW = {"vol", "mute", "mic_vol", "mic_mute", "agc"}
+a = sys.argv[1:]
+if not a or a[0] == "get":
+    c = C.load()
+    live = {"vol": C.amget("Speaker"), "mic_vol": C.amget("Mic"), "agc": C.amget("Auto Gain Control")}
+    c["vol"], c["mute"] = live["vol"][0], not live["vol"][1]
+    c["mic_vol"], c["mic_mute"] = live["mic_vol"][0], not live["mic_vol"][1]
+    c["agc"] = live["agc"][1]; c["present"] = bool(C.card())
+    print(json.dumps(c))
+elif a[0] == "set":
+    k, v = a[1], json.loads(a[2])
+    c = C.update(**{k: v})
+    if k in HW: C.apply_hw(c)
+    else: C.reload_daemon()
+elif a[0] == "profile":
+    C.update(profile=a[1], eq=C.PROFILES[a[1]]); C.reload_daemon()

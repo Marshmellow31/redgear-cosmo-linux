@@ -21,7 +21,8 @@ SPEAKERS = [  # name, azimuth deg, wav
 ]
 DEFAULTS = {"profile": "Default", "eq": [0] * 10, "bass": 0, "virtual71": False,
             "dist": [26, 26, 26, 24, 26, 26, 26, 26], "karaoke": False,
-            "mic_boost": 0, "mic_nr": False, "mic_echo": False}
+            "mic_boost": 0, "mic_nr": False, "mic_echo": False,
+            "vol": None, "mute": None, "mic_vol": None, "mic_mute": None, "agc": None}
 
 def load():
     c = dict(DEFAULTS)
@@ -32,6 +33,24 @@ def load():
 def save(c):
     os.makedirs(os.path.dirname(CFG), exist_ok=True)
     json.dump(c, open(CFG, "w"), indent=1)
+
+def update(**kw):
+    """Merge changes into the saved config (fresh read, so panel/tray/CLI never clobber each other)."""
+    c = load(); c.update(kw); save(c); return c
+
+def reload_daemon():
+    import signal
+    p = daemon_pid()
+    if p: os.kill(p, signal.SIGHUP)
+    return p
+
+def apply_hw(c):
+    """Restore the remembered hardware mixer state (volume, mute, mic, AGC)."""
+    if c.get("vol") is not None: amix("Speaker", f"{c['vol']}%")
+    if c.get("mute") is not None: amix("Speaker", "mute" if c["mute"] else "unmute")
+    if c.get("mic_vol") is not None: amix("Mic", f"{c['mic_vol']}%", "cap")
+    if c.get("mic_mute") is not None: amix("Mic", "nocap" if c["mic_mute"] else "cap")
+    if c.get("agc") is not None: amix("Auto Gain Control", "on" if c["agc"] else "off")
 
 def run(*a):
     try: return subprocess.run(a, capture_output=True, text=True).stdout

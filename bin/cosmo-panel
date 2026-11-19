@@ -13,7 +13,7 @@ class Panel(Gtk.Window):
     def __init__(self):
         super().__init__(title="RedGear Cosmo 7.1")
         self.set_default_size(420, 1); self.set_border_width(10)
-        self.c = C.load(); self.eq_scales = []; self.dist_scales = []; self.pending = None
+        self.c = C.load(); self.eq_scales = []; self.dirty = {}; self.pending = None; self.dirty = {}
         nb = Gtk.Notebook(); self.add(nb)
         nb.append_page(self.playback_tab(), Gtk.Label(label="Playback"))
         nb.append_page(self.effects_tab(), Gtk.Label(label="Equalizer"))
@@ -33,24 +33,26 @@ class Panel(Gtk.Window):
         sw = Gtk.Switch(active=on, halign=Gtk.Align.END); sw.connect("notify::active", cb)
         g.attach(sw, 1, g.r, 1, 1); g.r += 1; return sw
 
-    def commit(self):
-        """Save config and tell the daemon to reload (debounced)."""
+    def hw(self, key, val):
+        C.apply_hw(C.update(**{key: val}))
+
+    def commit(self, **kw):
+        """Save changes (merged into a fresh config) and reload the daemon, debounced."""
+        self.dirty.update(kw)
         if self.pending: GLib.source_remove(self.pending)
         def go():
-            self.pending = None; C.save(self.c)
-            p = C.daemon_pid()
-            if p: os.kill(p, signal.SIGHUP)
-            else: subprocess.Popen([os.path.expanduser("~/.local/bin/cosmo-daemon")])
+            self.pending = None; C.update(**self.dirty); self.dirty = {}
+            if not C.reload_daemon(): subprocess.Popen([os.path.expanduser("~/.local/bin/cosmo-daemon")])
             return False
         self.pending = GLib.timeout_add(600, go)
 
-    def set(self, k, v): self.c[k] = v; self.commit()
+    def set(self, k, v): self.c[k] = v; self.commit(**{k: v})
 
     def playback_tab(self):
         g = self.grid()
         v, on = C.amget("Speaker")
-        self.slider(g, "Volume", v, lambda s: C.amix("Speaker", f"{int(s.get_value())}%"))
-        self.toggle(g, "Mute", not on, lambda s, _: C.amix("Speaker", "mute" if s.get_active() else "unmute"))
+        self.slider(g, "Volume", v, lambda s: self.hw("vol", int(s.get_value())))
+        self.toggle(g, "Mute", not on, lambda s, _: self.hw("mute", s.get_active()))
         self.slider(g, "Bass boost (dB)", self.c["bass"], lambda s: self.set("bass", int(s.get_value())), 0, 12)
         self.toggle(g, "Karaoke (reduce vocals)", self.c["karaoke"], lambda s, _: self.set("karaoke", s.get_active()))
         return g
@@ -71,10 +73,10 @@ class Panel(Gtk.Window):
         name = cb.get_active_text(); self.c["profile"] = name
         self.c["eq"] = list(C.PROFILES[name])
         for s, v in zip(self.eq_scales, self.c["eq"]): s.set_value(v)
-        self.commit()
+        self.commit(profile=name, eq=self.c["eq"])
     on_eq_dummy = None
     def on_eq(self, i, s):
-        self.c["eq"][i] = int(s.get_value()); self.commit()
+        self.c["eq"][i] = int(s.get_value()); self.commit(eq=self.c["eq"])
 
     def virtual_tab(self):
         g = self.grid()
@@ -84,7 +86,7 @@ class Panel(Gtk.Window):
             row = Gtk.Box(spacing=8)
             s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 5, 50, 1)
             s.set_hexpand(True); s.set_value(self.c["dist"][i])
-            s.connect("value-changed", lambda s, i=i: (self.c["dist"].__setitem__(i, int(s.get_value())), self.commit()))
+            s.connect("value-changed", lambda s, i=i: (self.c["dist"].__setitem__(i, int(s.get_value())), self.commit(dist=self.c["dist"])))
             b = Gtk.Button(label="Test"); b.connect("clicked", lambda _, i=i: C.speaker_test(i, SHARE))
             g.attach(Gtk.Label(label=f"{name} distance", xalign=0), 0, g.r, 1, 1)
             row.pack_start(s, True, True, 0); row.pack_start(b, False, False, 0)
@@ -94,10 +96,10 @@ class Panel(Gtk.Window):
     def mic_tab(self):
         g = self.grid()
         v, on = C.amget("Mic")
-        self.slider(g, "Mic volume", v, lambda s: C.amix("Mic", f"{int(s.get_value())}%", "cap"))
-        self.toggle(g, "Mic mute", not on, lambda s, _: C.amix("Mic", "nocap" if s.get_active() else "cap"))
+        self.slider(g, "Mic volume", v, lambda s: self.hw("mic_vol", int(s.get_value())))
+        self.toggle(g, "Mic mute", not on, lambda s, _: self.hw("mic_mute", s.get_active()))
         self.toggle(g, "Auto gain control", C.amget("Auto Gain Control")[1],
-                    lambda s, _: C.amix("Auto Gain Control", "on" if s.get_active() else "off"))
+                    lambda s, _: self.hw("agc", s.get_active()))
         self.slider(g, "Mic boost (dB)", self.c["mic_boost"], lambda s: self.set("mic_boost", int(s.get_value())), 0, 20)
         self.toggle(g, "Noise reduction", self.c["mic_nr"], lambda s, _: self.set("mic_nr", s.get_active()))
         return g

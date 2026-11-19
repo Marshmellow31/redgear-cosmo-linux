@@ -23,6 +23,14 @@ driver is needed. This project rebuilds the app's features on top of ALSA and Pi
 Not included: the licensed Dolby / DTS / Xear modes, echo cancellation, beamforming
 and Magic Voice.
 
+## Top bar (GNOME)
+
+A small GNOME Shell extension adds a headphone icon to the top bar while the headset is plugged in.
+Its menu has volume, mute, virtual 7.1, karaoke, mic mute, noise reduction, profiles, and a link to the full panel.
+`install.sh` installs it. Log out and back in once (Wayland), then run `gnome-extensions enable redgear-cosmo@local`.
+
+All settings are remembered in `~/.config/redgear-cosmo/config.json` and restored on every plug-in.
+
 ## How it works
 
 - `cosmo-daemon` runs a private PipeWire filter-chain ("Cosmo FX" sink and "Cosmo Mic"

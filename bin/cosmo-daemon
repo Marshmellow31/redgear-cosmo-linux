@@ -22,6 +22,7 @@ def term(*_):
 signal.signal(signal.SIGHUP, hup); signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
 open(C.PIDFILE, "w").write(str(os.getpid()))
 time.sleep(2)
+C.apply_hw(C.load())
 while True:
     if not C.card(): term()
     if reload_ or (child and child.poll() is not None):

@@ -1,0 +1,7 @@
+{
+  "uuid": "redgear-cosmo@local",
+  "name": "RedGear Cosmo 7.1",
+  "description": "Top-bar quick controls for the RedGear Cosmo 7.1 headset. Shown only while it is plugged in.",
+  "shell-version": ["49", "50", "51"],
+  "version": 1
+}
