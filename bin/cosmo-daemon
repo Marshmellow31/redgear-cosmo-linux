@@ -27,5 +27,7 @@ while True:
     if reload_ or (child and child.poll() is not None):
         reload_ = False; start()
         time.sleep(1.5)
-        subprocess.run(["wpctl", "set-default", "cosmo_fx"], capture_output=True)
+        for key, node in (("default.audio.sink", "cosmo_fx"), ("default.audio.source", "cosmo_mic")):
+            subprocess.run(["pw-metadata", "-n", "default", "0", key, '{"name":"%s"}' % node,
+                            "Spa:String:JSON"], capture_output=True)
     time.sleep(2)
