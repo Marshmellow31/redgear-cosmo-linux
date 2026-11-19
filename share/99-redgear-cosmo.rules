@@ -1,0 +1,2 @@
+# Launch the Cosmo panel when the headset (C-Media 0d8c:0012) is plugged in
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0d8c", ATTR{idProduct}=="0012", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="redgear-cosmo.service"

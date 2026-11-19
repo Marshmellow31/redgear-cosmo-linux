@@ -1,0 +1,7 @@
+[Unit]
+Description=RedGear Cosmo FX daemon (started on headset plug-in)
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/cosmo-daemon
+ExecStartPost=-/usr/bin/gtk-launch redgear-cosmo
+Restart=no

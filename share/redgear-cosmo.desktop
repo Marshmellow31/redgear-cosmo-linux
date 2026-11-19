@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=RedGear Cosmo 7.1
+Exec=sh -c "~/.local/bin/cosmo-panel"
+Icon=audio-headphones
+Categories=AudioVideo;Settings;

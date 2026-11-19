@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Runs the Cosmo FX PipeWire graph while the headset is plugged in. SIGHUP = reload config."""
+import os, signal, subprocess, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+sys.path.insert(0, os.path.expanduser("~/.local/share/redgear-cosmo/lib"))
+import cosmolib as C
+child = None; reload_ = True
+def start():
+    global child
+    stop(); C.write_conf(C.load())
+    child = subprocess.Popen(["pipewire", "-c", C.RUNCONF])
+def stop():
+    global child
+    if child: child.terminate(); child.wait(); child = None
+def hup(*_):
+    global reload_; reload_ = True
+def term(*_):
+    stop(); 
+    try: os.remove(C.PIDFILE)
+    except OSError: pass
+    sys.exit(0)
+signal.signal(signal.SIGHUP, hup); signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, term)
+open(C.PIDFILE, "w").write(str(os.getpid()))
+time.sleep(2)
+while True:
+    if not C.card(): term()
+    if reload_ or (child and child.poll() is not None):
+        reload_ = False; start()
+        time.sleep(1.5)
+        subprocess.run(["wpctl", "set-default", "cosmo_fx"], capture_output=True)
+    time.sleep(2)
