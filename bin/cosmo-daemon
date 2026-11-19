@@ -28,7 +28,5 @@ while True:
     if reload_ or (child and child.poll() is not None):
         reload_ = False; start()
         time.sleep(1.5)
-        for key, node in (("default.audio.sink", "cosmo_fx"), ("default.audio.source", "cosmo_mic")):
-            subprocess.run(["pw-metadata", "-n", "default", "0", key, '{"name":"%s"}' % node,
-                            "Spa:String:JSON"], capture_output=True)
+    C.ensure_routing()
     time.sleep(2)

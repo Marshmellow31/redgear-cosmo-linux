@@ -200,6 +200,33 @@ def write_conf(c):
     os.makedirs(os.path.dirname(RUNCONF), exist_ok=True)
     open(RUNCONF, "w").write(build_conf(c))
 
+def _meta_default():
+    out = subprocess.run(["pw-metadata", "-n", "default", "0"], capture_output=True, text=True).stdout
+    return {m.group(1): m.group(2) for m in re.finditer(r"key:'([^']+)' value:'([^']*)'", out)}
+
+def ensure_routing():
+    """Keep cosmo_fx / cosmo_mic as the defaults and pull streams off the raw headset."""
+    md = _meta_default()
+    for key, node in (("audio.sink", "cosmo_fx"), ("audio.source", "cosmo_mic")):
+        for k in ("default.configured." + key, "default." + key):
+            if node not in md.get(k, ""):
+                subprocess.run(["pw-metadata", "-n", "default", "0", k, '{"name":"%s"}' % node,
+                                "Spa:String:JSON"], capture_output=True)
+    try:
+        objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True).stdout or "[]")
+    except ValueError: return
+    nodes = {o["id"]: o.get("info", {}).get("props", {}) for o in objs if o.get("type", "").endswith(":Node")}
+    names = {i: p.get("node.name", "") for i, p in nodes.items()}
+    if "cosmo_fx" not in names.values() or "cosmo_mic" not in names.values(): return
+    for o in objs:
+        if not o.get("type", "").endswith(":Link"): continue
+        i = o.get("info", {}); src, dst = i.get("output-node-id"), i.get("input-node-id")
+        if names.get(dst) == OUT_NODE and not names.get(src, "").startswith("cosmo_"):
+            subprocess.run(["pw-metadata", str(src), "target.object", "cosmo_fx"], capture_output=True)
+        if names.get(src) == IN_NODE and not names.get(dst, "").startswith("cosmo_") \
+           and nodes.get(dst, {}).get("media.class") == "Stream/Input/Audio":
+            subprocess.run(["pw-metadata", str(dst), "target.object", "cosmo_mic"], capture_output=True)
+
 def daemon_pid():
     try:
         p = int(open(PIDFILE).read())
