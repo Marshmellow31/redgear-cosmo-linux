@@ -1,112 +1,211 @@
 #!/usr/bin/env python3
 """RedGear Cosmo 7.1 control panel (light GTK3)."""
-import os, signal, subprocess, sys
+import os, subprocess, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 sys.path.insert(0, os.path.expanduser("~/.local/share/redgear-cosmo/lib"))
 import cosmolib as C
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib
+from gi.repository import Gtk, Gdk, GLib
 SHARE = None
+CSS = b"""
+.value { font-feature-settings: "tnum"; min-width: 4.5em; }
+.eqval { font-size: 85%; font-feature-settings: "tnum"; }
+.eqlab { font-size: 85%; opacity: .75; }
+.hint  { font-size: 85%; opacity: .6; }
+scale.eq slider { min-width: 18px; min-height: 18px; }
+"""
+
+def fmt_db(v): return "0 dB" if not v else f"{v:+.0f} dB"
+
 
 class Panel(Gtk.Window):
     def __init__(self):
         super().__init__(title="RedGear Cosmo 7.1")
-        self.set_default_size(420, 1); self.set_border_width(10)
-        self.c = C.load(); self.eq_scales = []; self.dirty = {}; self.pending = None; self.dirty = {}
+        self.set_default_size(520, 1); self.set_border_width(8)
+        p = Gtk.CssProvider(); p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, 600)
+        self.c = C.load(); self.dirty = {}; self.save_id = self.live_id = None
+        self.eq_scales, self.dist_scales = [], []
         nb = Gtk.Notebook(); self.add(nb)
-        nb.append_page(self.playback_tab(), Gtk.Label(label="Playback"))
-        nb.append_page(self.effects_tab(), Gtk.Label(label="Equalizer"))
-        nb.append_page(self.virtual_tab(), Gtk.Label(label="Virtual 7.1"))
-        nb.append_page(self.mic_tab(), Gtk.Label(label="Microphone"))
+        for title, page in (("Playback", self.playback_tab()), ("Equalizer", self.eq_tab()),
+                            ("Virtual 7.1", self.virtual_tab()), ("Microphone", self.mic_tab())):
+            nb.append_page(page, Gtk.Label(label=title))
         self.connect("destroy", Gtk.main_quit)
 
+    # ---------- widgets ----------
     def grid(self):
-        g = Gtk.Grid(row_spacing=10, column_spacing=12, margin=10); g.r = 0; return g
-    def slider(self, g, label, val, cb, lo=0, hi=100, step=1):
+        g = Gtk.Grid(row_spacing=12, column_spacing=12, margin=12); g.r = 0; return g
+
+    def scale(self, lo, hi, val, fmt, default=None, vertical=False):
+        s = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL,
+                                     lo, hi, 1)
+        s.set_value(val); s.set_draw_value(False); s.set_round_digits(0)
+        if vertical: s.set_inverted(True)
+        if default is not None:
+            s.add_mark(default, Gtk.PositionType.LEFT if vertical else Gtk.PositionType.BOTTOM, None)
+            # double-click puts the slider back to its default
+            s.connect("button-press-event", lambda w, e: (w.set_value(default), True)[1]
+                      if e.type == Gdk.EventType._2BUTTON_PRESS else False)
+        lab = Gtk.Label(label=fmt(val), xalign=1)
+        lab.get_style_context().add_class("eqval" if vertical else "value")
+        s.connect("value-changed", lambda w: lab.set_text(fmt(int(w.get_value()))))
+        return s, lab
+
+    def slider(self, g, label, val, cb, lo, hi, fmt, default=None):
         g.attach(Gtk.Label(label=label, xalign=0), 0, g.r, 1, 1)
-        s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
-        s.set_hexpand(True); s.set_value(val); s.connect("value-changed", cb)
-        g.attach(s, 1, g.r, 1, 1); g.r += 1; return s
+        s, lab = self.scale(lo, hi, val, fmt, default)
+        s.set_hexpand(True); s.connect("value-changed", lambda w: cb(int(w.get_value())))
+        g.attach(s, 1, g.r, 1, 1); g.attach(lab, 2, g.r, 1, 1); g.r += 1; return s
+
     def toggle(self, g, label, on, cb):
         g.attach(Gtk.Label(label=label, xalign=0), 0, g.r, 1, 1)
-        sw = Gtk.Switch(active=on, halign=Gtk.Align.END); sw.connect("notify::active", cb)
-        g.attach(sw, 1, g.r, 1, 1); g.r += 1; return sw
+        sw = Gtk.Switch(active=on, halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
+        sw.connect("notify::active", lambda w, _: cb(w.get_active()))
+        g.attach(sw, 1, g.r, 2, 1); g.r += 1; return sw
 
+    def hint(self, g, text):
+        l = Gtk.Label(label=text, xalign=0, wrap=True); l.get_style_context().add_class("hint")
+        g.attach(l, 0, g.r, 3, 1); g.r += 1
+
+    # ---------- applying ----------
     def hw(self, key, val):
         C.apply_hw(C.update(**{key: val}))
 
-    def commit(self, **kw):
-        """Save changes (merged into a fresh config) and reload the daemon, debounced."""
-        self.dirty.update(kw)
-        if self.pending: GLib.source_remove(self.pending)
-        def go():
-            self.pending = None; C.update(**self.dirty); self.dirty = {}
+    def set(self, **kw):
+        """Effects: live-update the running graph right away, save to config shortly after."""
+        self.c.update(kw); self.dirty.update(kw)
+        if set(kw) & C.STRUCTURAL:
+            self.flush(); return
+        if not self.live_id: self.live_id = GLib.timeout_add(40, self.push_live)
+        if self.save_id: GLib.source_remove(self.save_id)
+        self.save_id = GLib.timeout_add(500, self.flush)
+
+    def push_live(self):
+        self.live_id = None
+        if not C.apply_live(self.c): self.flush()
+        return False
+
+    def flush(self):
+        if self.save_id: GLib.source_remove(self.save_id)
+        self.save_id = None
+        keys, self.dirty = list(self.dirty), {}
+        c = C.update(**{k: self.c[k] for k in keys})
+        if set(keys) & C.STRUCTURAL:
             if not C.reload_daemon(): subprocess.Popen([os.path.expanduser("~/.local/bin/cosmo-daemon")])
-            return False
-        self.pending = GLib.timeout_add(600, go)
+        return False
 
-    def set(self, k, v): self.c[k] = v; self.commit(**{k: v})
-
+    # ---------- tabs ----------
     def playback_tab(self):
         g = self.grid()
         v, on = C.amget("Speaker")
-        self.slider(g, "Volume", v, lambda s: self.hw("vol", int(s.get_value())))
-        self.toggle(g, "Mute", not on, lambda s, _: self.hw("mute", s.get_active()))
-        self.slider(g, "Bass boost (dB)", self.c["bass"], lambda s: self.set("bass", int(s.get_value())), 0, 12)
-        self.toggle(g, "Karaoke (reduce vocals)", self.c["karaoke"], lambda s, _: self.set("karaoke", s.get_active()))
+        self.slider(g, "Volume", v, lambda x: self.hw("vol", x), 0, 100, lambda x: f"{x}%")
+        self.toggle(g, "Mute", not on, lambda x: self.hw("mute", x))
+        self.slider(g, "Bass boost", self.c["bass"], lambda x: self.set(bass=x), 0, 12, fmt_db, 0)
+        self.toggle(g, "Karaoke (reduce vocals)", self.c["karaoke"], lambda x: self.set(karaoke=x))
+        self.hint(g, "Tip: double-click a slider to reset it.")
         return g
 
-    def effects_tab(self):
-        g = self.grid()
-        g.attach(Gtk.Label(label="Profile", xalign=0), 0, g.r, 1, 1)
-        cb = Gtk.ComboBoxText()
-        for p in C.PROFILES: cb.append_text(p)
-        cb.set_active(list(C.PROFILES).index(self.c["profile"]) if self.c["profile"] in C.PROFILES else 0)
-        cb.connect("changed", self.on_profile); g.attach(cb, 1, g.r, 1, 1); g.r += 1
+    def eq_tab(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=12)
+        top = Gtk.Box(spacing=8)
+        top.pack_start(Gtk.Label(label="Profile"), False, False, 0)
+        self.prof = Gtk.ComboBoxText()
+        for p in C.PROFILES: self.prof.append_text(p)
+        self.prof.append_text("Custom")
+        names = list(C.PROFILES) + ["Custom"]
+        self.prof.set_active(names.index(self.c["profile"]) if self.c["profile"] in names else len(names) - 1)
+        self.prof.connect("changed", self.on_profile)
+        top.pack_start(self.prof, False, False, 0)
+        rst = Gtk.Button(label="Flat"); rst.connect("clicked", lambda _: self.set_eq([0] * 10, "Default"))
+        top.pack_end(rst, False, False, 0)
+        box.pack_start(top, False, False, 0)
+
+        bands = Gtk.Grid(column_spacing=4, row_spacing=4, column_homogeneous=True)
+        db = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        for t in ("+12", "", "0", "", "−12"):
+            l = Gtk.Label(label=t, yalign=0.5, vexpand=True); l.get_style_context().add_class("eqlab"); db.pack_start(l, True, True, 0)
+        bands.attach(db, 0, 1, 1, 1)
+        self.updating = False
         for i, f in enumerate(C.BANDS):
-            lab = f"{f} Hz" if f < 1000 else f"{f // 1000} kHz"
-            s = self.slider(g, lab, self.c["eq"][i], lambda s, i=i: self.on_eq(i, s), -12, 12)
+            s, lab = self.scale(-12, 12, self.c["eq"][i], lambda x: f"{x:+d}" if x else "0", 0, vertical=True)
+            s.get_style_context().add_class("eq"); s.set_size_request(-1, 200); s.set_vexpand(True)
+            s.connect("value-changed", lambda w, i=i: self.on_eq(i, int(w.get_value())))
+            lab.set_xalign(0.5)
+            name = Gtk.Label(label=f"{f}" if f < 1000 else f"{f // 1000}k"); name.get_style_context().add_class("eqlab")
+            bands.attach(lab, i + 1, 0, 1, 1); bands.attach(s, i + 1, 1, 1, 1); bands.attach(name, i + 1, 2, 1, 1)
             self.eq_scales.append(s)
-        return g
+        hz = Gtk.Label(label="Hz"); hz.get_style_context().add_class("eqlab"); bands.attach(hz, 0, 2, 1, 1)
+        box.pack_start(bands, True, True, 0)
+        return box
+
+    def set_eq(self, vals, profile):
+        self.updating = True
+        for s, v in zip(self.eq_scales, vals): s.set_value(v)
+        self.updating = False
+        names = list(C.PROFILES) + ["Custom"]
+        self.prof.handler_block_by_func(self.on_profile)
+        self.prof.set_active(names.index(profile)); self.prof.handler_unblock_by_func(self.on_profile)
+        self.set(profile=profile, eq=list(vals))
+
     def on_profile(self, cb):
-        name = cb.get_active_text(); self.c["profile"] = name
-        self.c["eq"] = list(C.PROFILES[name])
-        for s, v in zip(self.eq_scales, self.c["eq"]): s.set_value(v)
-        self.commit(profile=name, eq=self.c["eq"])
-    on_eq_dummy = None
-    def on_eq(self, i, s):
-        self.c["eq"][i] = int(s.get_value()); self.commit(eq=self.c["eq"])
+        name = cb.get_active_text()
+        if name in C.PROFILES: self.set_eq(list(C.PROFILES[name]), name)
+
+    def on_eq(self, i, v):
+        if self.updating: return
+        eq = list(self.c["eq"]); eq[i] = v
+        match = next((p for p, vals in C.PROFILES.items() if list(vals) == eq), "Custom")
+        if match != self.prof.get_active_text():
+            names = list(C.PROFILES) + ["Custom"]
+            self.prof.handler_block_by_func(self.on_profile)
+            self.prof.set_active(names.index(match)); self.prof.handler_unblock_by_func(self.on_profile)
+        self.set(eq=eq, profile=match)
 
     def virtual_tab(self):
         g = self.grid()
-        self.toggle(g, "Virtual 7.1 speakers (headphone surround)", self.c["virtual71"],
-                    lambda s, _: self.set("virtual71", s.get_active()))
+        self.toggle(g, "Virtual 7.1 surround", self.c["virtual71"], self.on_v71)
+        self.hint(g, "Distance of each virtual speaker from your head. Closer = louder and more direct.")
+        self.dist_rows = []
         for i, (name, az, _) in enumerate(C.SPEAKERS):
-            row = Gtk.Box(spacing=8)
-            s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 5, 50, 1)
-            s.set_hexpand(True); s.set_value(self.c["dist"][i])
-            s.connect("value-changed", lambda s, i=i: (self.c["dist"].__setitem__(i, int(s.get_value())), self.commit(dist=self.c["dist"])))
-            b = Gtk.Button(label="Test"); b.connect("clicked", lambda _, i=i: C.speaker_test(i, SHARE))
-            g.attach(Gtk.Label(label=f"{name} distance", xalign=0), 0, g.r, 1, 1)
-            row.pack_start(s, True, True, 0); row.pack_start(b, False, False, 0)
-            g.attach(row, 1, g.r, 1, 1); g.r += 1
+            s, lab = self.scale(5, 50, self.c["dist"][i], lambda x: f"{x / 10:.1f} m", C.DEFAULTS["dist"][i])
+            s.set_hexpand(True)
+            s.connect("value-changed", lambda w, i=i: self.on_dist(i, int(w.get_value())))
+            b = Gtk.Button.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON)
+            b.set_tooltip_text(f"Play a test tone from {name}")
+            b.connect("clicked", lambda _, i=i: C.speaker_test(i, SHARE))
+            l = Gtk.Label(label=name, xalign=0)
+            g.attach(l, 0, g.r, 1, 1); g.attach(s, 1, g.r, 1, 1); g.attach(lab, 2, g.r, 1, 1); g.attach(b, 3, g.r, 1, 1)
+            g.r += 1; self.dist_scales.append(s); self.dist_rows += [l, s, lab]
+        rst = Gtk.Button(label="Reset distances", halign=Gtk.Align.END)
+        rst.connect("clicked", lambda _: [s.set_value(C.DEFAULTS["dist"][i]) for i, s in enumerate(self.dist_scales)])
+        g.attach(rst, 0, g.r, 4, 1); g.r += 1; self.dist_rows.append(rst)
+        self.sync_dist()
         return g
+
+    def sync_dist(self):
+        for w in self.dist_rows: w.set_sensitive(self.c["virtual71"])
+
+    def on_v71(self, on):
+        self.set(virtual71=on); self.sync_dist()
+
+    def on_dist(self, i, v):
+        d = list(self.c["dist"]); d[i] = v; self.set(dist=d)
 
     def mic_tab(self):
         g = self.grid()
         v, on = C.amget("Mic")
-        self.slider(g, "Mic volume", v, lambda s: self.hw("mic_vol", int(s.get_value())))
-        self.toggle(g, "Mic mute", not on, lambda s, _: self.hw("mic_mute", s.get_active()))
-        self.toggle(g, "Auto gain control", C.amget("Auto Gain Control")[1],
-                    lambda s, _: self.hw("agc", s.get_active()))
-        self.slider(g, "Mic boost (dB)", self.c["mic_boost"], lambda s: self.set("mic_boost", int(s.get_value())), 0, 20)
-        self.toggle(g, "Noise reduction", self.c["mic_nr"], lambda s, _: self.set("mic_nr", s.get_active()))
+        self.slider(g, "Mic volume", v, lambda x: self.hw("mic_vol", x), 0, 100, lambda x: f"{x}%")
+        self.toggle(g, "Mute microphone", not on, lambda x: self.hw("mic_mute", x))
+        self.toggle(g, "Auto gain control", C.amget("Auto Gain Control")[1], lambda x: self.hw("agc", x))
+        self.slider(g, "Mic boost", self.c["mic_boost"], lambda x: self.set(mic_boost=x), 0, 20, fmt_db, 0)
+        self.toggle(g, "Noise reduction", self.c["mic_nr"], lambda x: self.set(mic_nr=x))
         return g
+
 
 if __name__ == "__main__":
     if not C.card():
         print("Cosmo headphone not found"); sys.exit(1)
     if not C.daemon_pid():
         subprocess.Popen([os.path.expanduser("~/.local/bin/cosmo-daemon")])
-    Panel().show_all(); Gtk.main()
+    w = Panel(); w.connect("delete-event", lambda w, e: (w.flush(), False)[1]); w.show_all(); Gtk.main()

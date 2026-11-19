@@ -73,7 +73,9 @@ def amget(ctl):
     return (int(m.group(1)) if m else 0), "[on]" in out
 
 # ---- PipeWire graph ----
+_CTL = []  # (node, control, value) recorded while building, for live updates
 def _n(name, label, ctl=None, cfg=None):
+    for k, v in (ctl or {}).items(): _CTL.append((name, k, v))
     s = f'{{ type = builtin name = {name} label = {label}'
     if cfg: s += f' config = {{ {cfg} }}'
     if ctl: s += " control = { " + " ".join(f'"{k}" = {v}' for k, v in ctl.items()) + " }"
@@ -156,12 +158,11 @@ def sink_graph(c):
         last = {"L": "kL:Out", "R": "kR:Out"}
     # EQ + bass boost
     eq = c["eq"]; steps = []
+    # every band always exists (0 dB = transparent) so sliders can change them live
     for i, f in enumerate(BANDS):
-        if eq[i]:
-            lab = "bq_lowshelf" if i == 0 else "bq_highshelf" if i == 9 else "bq_peaking"
-            steps.append((f"eq{i}", lab, {"Freq": f, "Q": 1.0, "Gain": eq[i]}))
-    if c["bass"]:
-        steps.append(("bass", "bq_lowshelf", {"Freq": 110, "Q": 0.7, "Gain": c["bass"]}))
+        lab = "bq_lowshelf" if i == 0 else "bq_highshelf" if i == 9 else "bq_peaking"
+        steps.append((f"eq{i}", lab, {"Freq": f, "Q": 1.0, "Gain": eq[i]}))
+    steps.append(("bass", "bq_lowshelf", {"Freq": 110, "Q": 0.7, "Gain": c["bass"]}))
     peak = max([0] + [s[2]["Gain"] for s in steps if s[2]["Gain"] > 0])
     steps.append(("head", "linear", {"Mult": f"{10 ** (-peak / 20) * (0.55 if c['virtual71'] else 1):.4f}", "Add": 0}))
     for ch in "LR":
@@ -246,6 +247,32 @@ def ensure_routing():
         if names.get(src) == IN_NODE and not names.get(dst, "").startswith("cosmo_") \
            and nodes.get(dst, {}).get("media.class") == "Stream/Input/Audio":
             subprocess.run(["pw-metadata", str(dst), "target.object", "cosmo_mic"], capture_output=True)
+
+STRUCTURAL = {"virtual71", "karaoke", "mic_echo"}  # these change the graph -> restart
+
+def _ctls(fn, c):
+    del _CTL[:]; fn(c); return [(n, k, v) for n, k, v in _CTL]
+
+def _node_ids():
+    try: objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True).stdout or "[]")
+    except ValueError: return {}
+    return {o["info"]["props"].get("node.name"): o["id"] for o in objs
+            if o.get("type", "").endswith(":Node") and "props" in o.get("info", {})}
+
+def apply_live(c):
+    """Push slider values into the running graph without restarting it. False if not running."""
+    ids = _node_ids()
+    if "cosmo_fx" not in ids: return False
+    for node, fn in (("cosmo_fx", sink_graph), ("cosmo_mic_in", source_graph), ("cosmo_mic", source_graph)):
+        if node not in ids: continue
+        ps = " ".join(f'"{n}:{k}" {float(v)}' for n, k, v in _ctls(fn, c) if k != "Freq" or n in ("hp", "lp"))
+        subprocess.run(["pw-cli", "s", str(ids[node]), "Props", "{ params = [ %s ] }" % ps], capture_output=True)
+    return True
+
+def apply_fx(c, keys):
+    """Live-update when possible; restart the graph for structural changes."""
+    if (set(keys) & STRUCTURAL) or not apply_live(c):
+        reload_daemon()
 
 def daemon_pid():
     try:

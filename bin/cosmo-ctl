@@ -18,6 +18,6 @@ elif a[0] == "set":
     k, v = a[1], json.loads(a[2])
     c = C.update(**{k: v})
     if k in HW: C.apply_hw(c)
-    else: C.reload_daemon()
+    else: C.apply_fx(c, [k])
 elif a[0] == "profile":
-    C.update(profile=a[1], eq=C.PROFILES[a[1]]); C.reload_daemon()
+    C.apply_fx(C.update(profile=a[1], eq=C.PROFILES[a[1]]), ["eq"])
