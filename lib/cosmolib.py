@@ -22,7 +22,8 @@ SPEAKERS = [  # name, azimuth deg, wav
 DEFAULTS = {"profile": "Default", "eq": [0] * 10, "bass": 0, "virtual71": False,
             "dist": [26, 26, 26, 24, 26, 26, 26, 26], "karaoke": False,
             "mic_boost": 0, "mic_nr": False, "mic_echo": False,
-            "vol": None, "mute": None, "mic_vol": None, "mic_mute": None, "agc": None}
+            "vol": None, "mute": None, "mic_vol": None, "mic_mute": None, "agc": None,
+            "sidetone": None, "sidetone_vol": None}
 
 def load():
     c = dict(DEFAULTS)
@@ -48,8 +49,11 @@ def apply_hw(c):
     """Restore the remembered hardware mixer state (volume, mute, mic, AGC)."""
     if c.get("vol") is not None: amix("Speaker", f"{c['vol']}%")
     if c.get("mute") is not None: amix("Speaker", "mute" if c["mute"] else "unmute")
-    if c.get("mic_vol") is not None: amix("Mic", f"{c['mic_vol']}%", "cap")
-    if c.get("mic_mute") is not None: amix("Mic", "nocap" if c["mic_mute"] else "cap")
+    # 'Mic' has both a capture volume and a playback (sidetone / hear-yourself) volume
+    if c.get("mic_vol") is not None: amix("Mic", "capture", f"{c['mic_vol']}%")
+    if c.get("mic_mute") is not None: amix("Mic", "capture", "nocap" if c["mic_mute"] else "cap")
+    if c.get("sidetone_vol") is not None: amix("Mic", "playback", f"{c['sidetone_vol']}%")
+    if c.get("sidetone") is not None: amix("Mic", "playback", "unmute" if c["sidetone"] else "mute")
     if c.get("agc") is not None: amix("Auto Gain Control", "on" if c["agc"] else "off")
 
 def run(*a):
@@ -67,8 +71,13 @@ def amix(ctl, *v):
     c = card()
     return run("amixer", "-c", c, "sset", ctl, *v) if c else ""
 
-def amget(ctl):
+def amget(ctl, which=None):
+    """(percent, switch_on) of a mixer control; which = 'Playback' / 'Capture' for split controls."""
     c = card(); out = run("amixer", "-c", c, "sget", ctl) if c else ""
+    out = out.split("Limits:")[-1]
+    if which:
+        m = re.search(which + r" \d+ \[(\d+)%\](?: \[[-\d.]+dB\])? \[(on|off)\]", out)
+        if m: return int(m.group(1)), m.group(2) == "on"
     m = re.search(r"\[(\d+)%\]", out)
     return (int(m.group(1)) if m else 0), "[on]" in out
 
@@ -171,11 +180,16 @@ def sink_graph(c):
     return nodes, links, last
 
 def source_graph(c):
-    nodes = [_n("hp", "bq_highpass", {"Freq": 140 if c["mic_nr"] else 20, "Q": 0.7, "Gain": 0}),
-             _n("lp", "bq_lowpass", {"Freq": 7500 if c["mic_nr"] else 20000, "Q": 0.7, "Gain": 0}),
+    """Mic clean-up after the (optional) WebRTC stage: rumble filter, boost, safety limiter."""
+    nodes = [_n("hp", "bq_highpass", {"Freq": 100 if c["mic_nr"] else 70, "Q": 0.7, "Gain": 0}),
              _n("gain", "linear", {"Mult": f"{10 ** (c['mic_boost'] / 20):.4f}", "Add": 0})]
-    links = ['{ output = "hp:Out" input = "lp:In" }', '{ output = "lp:Out" input = "gain:In" }']
-    return nodes, links, "hp:In", "gain:Out"
+    links = ['{ output = "hp:Out" input = "gain:In" }']; last = "gain:Out"
+    # never let the boost hard-clip: clamp just under full scale
+    nodes.append(_n("lim", "clamp", {"Min": -0.97, "Max": 0.97}))
+    links.append(f'{{ output = "{last}" input = "lim:In" }}')
+    return nodes, links, "hp:In", "lim:Out"
+
+def webrtc_needed(c): return bool(c["mic_nr"] or c["mic_echo"])
 
 def build_conf(c, with_mic=True):
     sn, sl, last = sink_graph(c)
@@ -202,12 +216,27 @@ def build_conf(c, with_mic=True):
       filter.graph = {{ nodes = [ {" ".join(mn)} ] links = [ {" ".join(ml)} ]
         inputs = [ "{i}" ] outputs = [ "{o}" ] }}
       capture.props = {{ node.name = "cosmo_mic_in" node.passive = true audio.position = [ MONO ]
-        target.object = "{IN_NODE}" }}
+        target.object = "{"cosmo_mic_clean" if webrtc_needed(c) else IN_NODE}" }}
       playback.props = {{ node.name = "cosmo_mic" media.class = Audio/Source audio.position = [ MONO ] }}
     }} }}
 '''
+    if with_mic and webrtc_needed(c):
+        nr = "true" if c["mic_nr"] else "false"
+        mic = f'''  {{ name = libpipewire-module-echo-cancel
+    args = {{
+      library.name = aec/libspa-aec-webrtc
+      monitor.mode = true
+      audio.channels = 1 audio.position = [ MONO ]
+      aec.args = {{ webrtc.noise_suppression = {nr} webrtc.transient_suppression = {nr}
+                   webrtc.high_pass_filter = true webrtc.gain_control = false webrtc.voice_detection = false }}
+      capture.props = {{ node.name = "cosmo_mic_raw" node.passive = true target.object = "{IN_NODE}" }}
+      source.props = {{ node.name = "cosmo_mic_clean" node.description = "Cosmo Mic (pre-processing)"
+                       priority.session = 1 }}
+      sink.props = {{ node.name = "cosmo_mic_ref" node.passive = true target.object = "{OUT_NODE}" }}
+    }} }}
+''' + mic
     return f'''context.properties = {{ log.level = 1 }}
-context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert  support.* = support/libspa-support }}
+context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert  support.* = support/libspa-support aec.* = aec/libspa-aec-webrtc }}
 context.modules = [
   {{ name = libpipewire-module-rt args = {{ nice.level = -11 }} flags = [ ifexists nofail ] }}
   {{ name = libpipewire-module-protocol-native }}
@@ -248,7 +277,7 @@ def ensure_routing():
            and nodes.get(dst, {}).get("media.class") == "Stream/Input/Audio":
             subprocess.run(["pw-metadata", str(dst), "target.object", "cosmo_mic"], capture_output=True)
 
-STRUCTURAL = {"virtual71", "karaoke", "mic_echo"}  # these change the graph -> restart
+STRUCTURAL = {"virtual71", "karaoke", "mic_echo", "mic_nr"}  # these change the graph -> restart
 
 def _ctls(fn, c):
     del _CTL[:]; fn(c); return [(n, k, v) for n, k, v in _CTL]
@@ -265,7 +294,7 @@ def apply_live(c):
     if "cosmo_fx" not in ids: return False
     for node, fn in (("cosmo_fx", sink_graph), ("cosmo_mic_in", source_graph), ("cosmo_mic", source_graph)):
         if node not in ids: continue
-        ps = " ".join(f'"{n}:{k}" {float(v)}' for n, k, v in _ctls(fn, c) if k != "Freq" or n in ("hp", "lp"))
+        ps = " ".join(f'"{n}:{k}" {float(v)}' for n, k, v in _ctls(fn, c) if k != "Freq" or n == "hp")
         subprocess.run(["pw-cli", "s", str(ids[node]), "Props", "{ params = [ %s ] }" % ps], capture_output=True)
     return True
 

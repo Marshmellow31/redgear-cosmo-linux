@@ -31,7 +31,9 @@ class Panel(Gtk.Window):
         for title, page in (("Playback", self.playback_tab()), ("Equalizer", self.eq_tab()),
                             ("Virtual 7.1", self.virtual_tab()), ("Microphone", self.mic_tab())):
             nb.append_page(page, Gtk.Label(label=title))
-        self.connect("destroy", Gtk.main_quit)
+        # the level meter only records while the Microphone tab is showing
+        nb.connect("switch-page", lambda nb, p, n: self.meter_start() if n == 3 else self.meter_stop())
+        self.connect("destroy", lambda *_: (self.meter_stop(), Gtk.main_quit()))
 
     # ---------- widgets ----------
     def grid(self):
@@ -194,13 +196,71 @@ class Panel(Gtk.Window):
 
     def mic_tab(self):
         g = self.grid()
-        v, on = C.amget("Mic")
+        # live input level of the processed mic (what apps hear)
+        g.attach(Gtk.Label(label="Level", xalign=0), 0, g.r, 1, 1)
+        self.meter = Gtk.LevelBar(min_value=0, max_value=1, hexpand=True, valign=Gtk.Align.CENTER)
+        self.meter.add_offset_value("low", 0.70); self.meter.add_offset_value("high", 0.92)
+        self.meter.add_offset_value("full", 1.0)
+        self.meter_lab = Gtk.Label(label="—", xalign=1); self.meter_lab.get_style_context().add_class("value")
+        g.attach(self.meter, 1, g.r, 1, 1); g.attach(self.meter_lab, 2, g.r, 1, 1); g.r += 1
+        self.test_btn = Gtk.Button(label="Test microphone (record 5 s and play back)")
+        self.test_btn.connect("clicked", self.mic_test); g.attach(self.test_btn, 0, g.r, 3, 1); g.r += 1
+
+        v, on = C.amget("Mic", "Capture")
         self.slider(g, "Mic volume", v, lambda x: self.hw("mic_vol", x), 0, 100, lambda x: f"{x}%")
         self.toggle(g, "Mute microphone", not on, lambda x: self.hw("mic_mute", x))
-        self.toggle(g, "Auto gain control", C.amget("Auto Gain Control")[1], lambda x: self.hw("agc", x))
+        self.toggle(g, "Auto gain control (hardware)", C.amget("Auto Gain Control")[1], lambda x: self.hw("agc", x))
         self.slider(g, "Mic boost", self.c["mic_boost"], lambda x: self.set(mic_boost=x), 0, 20, fmt_db, 0)
-        self.toggle(g, "Noise reduction", self.c["mic_nr"], lambda x: self.set(mic_nr=x))
+        self.toggle(g, "Noise suppression (WebRTC)", self.c["mic_nr"], lambda x: self.set(mic_nr=x))
+        self.toggle(g, "Echo cancellation", self.c["mic_echo"], lambda x: self.set(mic_echo=x))
+        sv, son = C.amget("Mic", "Playback")
+        self.toggle(g, "Hear myself (sidetone)", son, lambda x: self.hw("sidetone", x))
+        self.slider(g, "Sidetone level", sv, lambda x: self.hw("sidetone_vol", x), 0, 100, lambda x: f"{x}%")
+        self.hint(g, "Noise suppression removes fans, hiss and keyboard clicks. Echo cancellation stops "
+                     "sound from your headphones leaking into the mic. A limiter always prevents clipping.")
+        self.meter_proc = None
         return g
+
+    # ---------- mic level meter / test ----------
+    def meter_start(self):
+        if self.meter_proc: return
+        try:
+            self.meter_proc = subprocess.Popen(
+                ["pw-record", "--raw", "--target", "cosmo_mic", "--rate", "16000", "--channels", "1",
+                 "--format", "s16", "--latency", "50ms", "-P", "{ node.name = cosmo_meter }", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except FileNotFoundError: return
+        self.meter_peak = 0.0
+        GLib.io_add_watch(self.meter_proc.stdout, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, self.meter_read)
+
+    def meter_read(self, src, cond):
+        import array, math
+        data = os.read(src.fileno(), 3200) if cond & GLib.IO_IN else b""
+        if not data: return False
+        a = array.array("h", data[: len(data) // 2 * 2])
+        pk = max((abs(x) for x in a), default=0) / 32768
+        self.meter_peak = max(pk, self.meter_peak * 0.85)  # fast attack, smooth fall
+        db = 20 * math.log10(max(self.meter_peak, 1e-5))
+        self.meter.set_value(max(0.0, (db + 60) / 60))
+        self.meter_lab.set_text("CLIP" if pk >= 0.96 else f"{db:.0f} dB" if db > -60 else "—")
+        return True
+
+    def meter_stop(self):
+        if self.meter_proc: self.meter_proc.terminate(); self.meter_proc = None
+        self.meter.set_value(0); self.meter_lab.set_text("—")
+
+    def mic_test(self, b):
+        path = os.path.expanduser("~/.cache/cosmo-mictest.wav")
+        b.set_sensitive(False); b.set_label("Recording… speak now (5 s)")
+        rec = subprocess.Popen(["pw-record", "--target", "cosmo_mic", "--channels", "1",
+                                "-P", "{ node.name = cosmo_mictest }", path], stderr=subprocess.DEVNULL)
+        def play():
+            rec.terminate(); rec.wait(); b.set_label("Playing back…")
+            p = subprocess.Popen(["pw-play", "--target", "cosmo_fx", path], stderr=subprocess.DEVNULL)
+            GLib.child_watch_add(GLib.PRIORITY_DEFAULT, p.pid, lambda *_: (
+                b.set_label("Test microphone (record 5 s and play back)"), b.set_sensitive(True)))
+            return False
+        GLib.timeout_add(5000, play)
 
 
 if __name__ == "__main__":

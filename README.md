@@ -18,7 +18,7 @@ driver is needed. This project rebuilds the app's features on top of ALSA and Pi
 | Playback | Volume, mute, bass boost, karaoke (vocal reduction) |
 | Equalizer | 10-band EQ with the original Default / HiFi / Movie / Music presets |
 | Virtual 7.1 | Headphone surround from 8 virtual speakers, per-speaker distance, speaker test beeps |
-| Microphone | Volume, mute, auto gain, boost, noise reduction |
+| Microphone | Volume, mute, hardware auto gain, boost with clip limiter, WebRTC noise suppression, echo cancellation, hear-myself (sidetone), live level meter, record-and-play-back test |
 
 Not included: the licensed Dolby / DTS / Xear modes, echo cancellation, beamforming
 and Magic Voice.
